@@ -8,6 +8,7 @@ agnostic and is not required at runtime.
 from .client import ManagerClient, ManagerError
 from .db import OwnershipDB
 from .server import ManagerCore, RuntimeFunctionSpec, TripWatchdog, serve_manager
+from .telegraf import TelegrafSender, build_line
 
 __all__ = [
     "ManagerClient",
@@ -15,6 +16,8 @@ __all__ = [
     "ManagerCore",
     "OwnershipDB",
     "RuntimeFunctionSpec",
+    "TelegrafSender",
     "TripWatchdog",
+    "build_line",
     "serve_manager",
 ]
