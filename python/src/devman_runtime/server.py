@@ -238,11 +238,16 @@ class ManagerCore:
     def _connect_client(self, client: str, force: bool = False) -> str:
         with self._sessions_lock:
             if client in self._sessions_by_name:
-                if not force:
+                # Reject only if the existing session is still live; a
+                # lease-expired session (crashed / ungracefully closed client)
+                # is evicted so the name can reconnect without --force.
+                if not force and self.is_client_live(client):
                     raise RuntimeError(f"client '{client}' is already connected")
                 old_session = self._sessions_by_name[client]
                 self._sessions_by_name.pop(client, None)
                 self._sessions_by_id.pop(old_session, None)
+                if not force:
+                    self._log(f"evicted stale session for '{client}' (lease expired) on reconnect")
             session = uuid.uuid4().hex
             self._sessions_by_name[client] = session
             self._sessions_by_id[session] = client
