@@ -16,20 +16,21 @@ a normal dependency upgrade instead of regeneration.
   (`set_link_groups` / `list_link_groups`).
 - `devman_runtime.server` — `ManagerCore` and `serve_manager`: request
   dispatch with ownership enforcement, device lifecycle/periodic hooks,
-  `TripWatchdog` (powers off linked partners when a channel trips, with
-  lease-based stale-group janitoring).
+  client leases. Hook files receive `core` in their context, so
+  device-specific safety monitors (e.g. the CAEN trip watchdog in
+  caenhv-devman's server_hooks.py) can use the registry and leases.
 - `devman_runtime.db` — SQLite-backed ownership and link-group registry.
 
 ## Server features
 
-- `trip_watchdog_interval` / `--trip-watchdog-interval`: poll registered
-  link groups and power off partners of a tripped channel, even when the
-  registering client is offline.
 - `client_lease_sec` / `--client-lease-sec`: any authenticated request
-  renews a client lease; groups of lease-expired clients are janitored when
-  all their channels are off, and kept protected while energized.
+  renews a client lease; `core.is_client_live(name)` exposes it to hooks
+  (used e.g. for janitoring stale link groups).
 - Periodic hook (`periodic_file` / `periodic_function` +
   `periodic_interval_sec`): run a user callback on an interval with access
-  to the device singleton.
+  to the device singleton and the core.
+
+Device-specific policies (what a "trip" means, when to power off partners)
+belong in per-bridge hook files, not in this package.
 
 This package is used by, e.g., `caenhv-devman-client`.

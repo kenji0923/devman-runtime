@@ -21,207 +21,6 @@ from .protocol import recv_message, send_message
 
 _EXPAND_FIELD_RE = re.compile(r"\{([A-Za-z_]\w*)\[\]\}")
 
-_CHANNEL_RESOURCE_RE = re.compile(r"^slot:(\d+):ch:(\d+)$")
-
-
-class TripWatchdog:
-    """Monitor registered link groups and power off partners when one trips.
-
-    Runs server-side so linked channels stay protected even when the client
-    application that registered the groups is closed. Status is read and Pw
-    is written directly on the device singleton, bypassing ownership checks:
-    powering a channel off is the inherently safe direction.
-    """
-
-    # Status bits per CAEN convention: 0 = ON, 6 = external trip, 8 = internal trip.
-    ON_MASK = 1 << 0
-    TRIP_MASK = (1 << 6) | (1 << 8)
-
-    def __init__(
-        self,
-        device: Any,
-        db: OwnershipDB,
-        interval_sec: float,
-        is_client_live: Any | None = None,
-        device_lock: Any | None = None,
-    ) -> None:
-        self._device = device
-        self._db = db
-        self._interval_sec = float(interval_sec)
-        self._is_client_live = is_client_live
-        self._device_lock = device_lock if device_lock is not None else Lock()
-        self._stop = Event()
-        self._thread: Thread | None = None
-        self._latched_groups: set[frozenset[tuple[int, int]]] = set()
-        self._warned_unsync: set[tuple[str, int]] = set()
-
-    def start(self) -> None:
-        if self._thread is not None:
-            return
-        self._thread = Thread(target=self._loop, name="devman-trip-watchdog", daemon=True)
-        self._thread.start()
-
-    def stop(self) -> None:
-        self._stop.set()
-        if self._thread is not None:
-            self._thread.join(timeout=2.0)
-            self._thread = None
-
-    def _log(self, message: str) -> None:
-        ts = datetime.now().isoformat(timespec="seconds")
-        print(f"[devman trip-watchdog {ts}] {message}", file=sys.stderr, flush=True)
-
-    @staticmethod
-    def _parse_members(resources: list[str]) -> list[tuple[int, int]]:
-        members: list[tuple[int, int]] = []
-        for resource in resources:
-            match = _CHANNEL_RESOURCE_RE.match(str(resource).strip())
-            if match:
-                members.append((int(match.group(1)), int(match.group(2))))
-        return members
-
-    def _read_status(self, slot: int, channel: int) -> int | None:
-        try:
-            with self._device_lock:
-                values = self._device.get_ch_param(slot, [channel], "Status")
-            return int(values[0])
-        except Exception:
-            return None
-
-    def _power_off(self, slot: int, channel: int) -> bool:
-        try:
-            with self._device_lock:
-                self._device.set_ch_param(slot, [channel], "Pw", 0)
-            return True
-        except Exception as exc:
-            self._log(f"FAILED to power off {slot}:{channel}: {exc}")
-            return False
-
-    def _read_param_any(self, slot: int, channel: int, names: list[str]) -> Any | None:
-        for name in names:
-            try:
-                with self._device_lock:
-                    values = self._device.get_ch_param(slot, [channel], name)
-                if isinstance(values, list) and values:
-                    return values[0]
-            except Exception:
-                continue
-        return None
-
-    def _group_settings_synchronized(self, members: list[tuple[int, int]]) -> bool:
-        """Same-name equality of RUp/RDWn plus PDwn match across the group.
-
-        The registering client keeps mixed-polarity groups with all four ramp
-        values equal, so same-name equality is a valid check for both group
-        kinds. Unreadable values are treated as synchronized (cannot judge).
-        """
-        for names, numeric in ((["RUp", "RUP"], True), (["RDWn", "RDown", "RDWN"], True), (["PDwn", "PDWN"], False)):
-            seen: set[Any] = set()
-            for slot, channel in members:
-                value = self._read_param_any(slot, channel, names)
-                if value is None:
-                    return True
-                if numeric:
-                    try:
-                        value = round(float(value), 6)
-                    except Exception:
-                        return True
-                else:
-                    value = str(value).strip().lower()
-                seen.add(value)
-            if len(seen) > 1:
-                return False
-        return True
-
-    def _janitor_group(self, client: str, group_idx: int, members: list[tuple[int, int]]) -> bool:
-        """Apply stale-group rules to a group whose owner lease expired.
-
-        Returns True when the group was removed. Energized groups are always
-        kept: dropping protection from powered channels on inference is the
-        wrong failure direction.
-        """
-        statuses: dict[tuple[int, int], int] = {}
-        for slot, channel in members:
-            status = self._read_status(slot, channel)
-            if status is None:
-                return False  # cannot judge: keep
-            statuses[(slot, channel)] = status
-        if any(status & (self.ON_MASK | self.TRIP_MASK) for status in statuses.values()):
-            if not self._group_settings_synchronized(members):
-                key = (client, int(group_idx))
-                if key not in self._warned_unsync:
-                    self._warned_unsync.add(key)
-                    names = ", ".join(f"{s}:{c}" for s, c in sorted(members))
-                    self._log(
-                        f"WARNING: energized group [{names}] of stale client '{client}' has "
-                        "unsynchronized settings; keeping protection"
-                    )
-            return False
-        removed = self._db.remove_link_group(client, int(group_idx))
-        if removed:
-            names = ", ".join(f"{s}:{c}" for s, c in sorted(members))
-            self._log(
-                f"removed stale link group [{names}] of client '{client}': lease expired, all channels off"
-            )
-            self._latched_groups.discard(frozenset(members))
-            self._warned_unsync.discard((client, int(group_idx)))
-        return bool(removed)
-
-    def check_groups_once(self) -> None:
-        try:
-            registered = self._db.link_groups_by_idx()
-        except Exception as exc:
-            self._log(f"failed to load link groups: {exc}")
-            return
-        for client, groups in registered.items():
-            live = True
-            if self._is_client_live is not None:
-                try:
-                    live = bool(self._is_client_live(client))
-                except Exception:
-                    live = True
-            for group_idx, resources in sorted(groups.items()):
-                members = self._parse_members(resources)
-                if len(members) < 2:
-                    continue
-                if not live and self._janitor_group(client, group_idx, members):
-                    continue
-                self._check_one_group(client, members)
-
-    def _check_one_group(self, client: str, members: list[tuple[int, int]]) -> None:
-        group_key = frozenset(members)
-        statuses: dict[tuple[int, int], int] = {}
-        for slot, channel in members:
-            status = self._read_status(slot, channel)
-            if status is not None:
-                statuses[(slot, channel)] = status
-        tripped = [key for key, status in statuses.items() if status & self.TRIP_MASK]
-        if not tripped:
-            self._latched_groups.discard(group_key)
-            return
-        if group_key in self._latched_groups:
-            return
-        self._latched_groups.add(group_key)
-        powered_off: list[str] = []
-        for slot, channel in sorted(members):
-            if (slot, channel) in tripped:
-                continue
-            status = statuses.get((slot, channel))
-            if status is None or not status & self.ON_MASK:
-                continue
-            if self._power_off(slot, channel):
-                powered_off.append(f"{slot}:{channel}")
-        tripped_names = ", ".join(f"{s}:{c}" for s, c in sorted(tripped))
-        self._log(
-            f"TRIP on {tripped_names} (group of client '{client}'); "
-            f"powered off partners: {', '.join(powered_off) or 'none'}"
-        )
-
-    def _loop(self) -> None:
-        while not self._stop.wait(self._interval_sec):
-            self.check_groups_once()
-
-
 def _expand_resource_template(template: str, context: dict[str, Any]) -> list[str]:
     expand_fields = _EXPAND_FIELD_RE.findall(template)
     if not expand_fields:
@@ -689,7 +488,6 @@ def serve_manager(
     singleton_file: str | None = None,
     singleton_file_function: str = "get_singleton",
     verbose: bool = False,
-    trip_watchdog_interval: float = 0.0,
     client_lease_sec: float = 90.0,
 ) -> None:
     if init_file and init_function:
@@ -716,6 +514,10 @@ def serve_manager(
         "db_path": db_path,
         "hook_args": dict(hook_args or {}),
         "extra_args": list(extra_args or []),
+        # Device-specific extensions (e.g. safety monitors in hook files)
+        # can use core.db, core.is_client_live, and the ownership/link
+        # registry through this reference.
+        "core": core,
     }
     periodic_thread: Thread | None = None
     periodic_stop = Event()
@@ -761,23 +563,8 @@ def serve_manager(
             periodic_thread.start()
             core._log(f"periodic hook started interval={interval_sec:.3f}s")
 
-        watchdog: TripWatchdog | None = None
-        if trip_watchdog_interval > 0.0 and core._singleton_object is not None:
-            watchdog = TripWatchdog(
-                core._singleton_object,
-                core.db,
-                trip_watchdog_interval,
-                is_client_live=core.is_client_live,
-                device_lock=core._singleton_lock,
-            )
-            watchdog.start()
-
-        try:
-            with _ManagerTCPServer((host, port), core) as server:
-                server.serve_forever()
-        finally:
-            if watchdog is not None:
-                watchdog.stop()
+        with _ManagerTCPServer((host, port), core) as server:
+            server.serve_forever()
     finally:
         periodic_stop.set()
         if periodic_thread is not None:
