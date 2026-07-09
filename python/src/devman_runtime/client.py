@@ -25,6 +25,8 @@ class ManagerClient:
             raise ValueError("client_name is required")
         self.timeout = timeout
         self._session: str | None = None
+        self._fresh: bool = False
+        self.last_meta: dict[str, Any] = {}
 
     def _request(self, payload: dict[str, Any]) -> dict[str, Any]:
         with socket.create_connection((self.host, self.port), timeout=self.timeout) as sock:
@@ -115,6 +117,10 @@ class ManagerClient:
         registered = response.get("link_groups")
         return registered if isinstance(registered, dict) else {}
 
+    def set_fresh(self, enabled: bool = True) -> None:
+        """Force subsequent reads to bypass the server cache (sticky)."""
+        self._fresh = bool(enabled)
+
     def invoke(
         self,
         function: str,
@@ -122,6 +128,7 @@ class ManagerClient:
         kwargs: dict[str, Any],
         resources: list[str],
         handle: str | None = None,
+        fresh: bool | None = None,
     ) -> Any:
         payload = self._with_session(
             {
@@ -134,5 +141,10 @@ class ManagerClient:
         )
         if handle is not None:
             payload["handle"] = handle
+        if fresh if fresh is not None else getattr(self, "_fresh", False):
+            payload["fresh"] = True
         response = self._request(payload)
+        # Freshness metadata of the last read, for callers that poll and want
+        # to tell a new device sample from a repeat (compare last_meta['ts']).
+        self.last_meta = {"cached": response.get("cached"), "ts": response.get("ts")}
         return response.get("result")

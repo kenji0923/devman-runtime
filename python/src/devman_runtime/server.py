@@ -4,6 +4,7 @@ import importlib
 import importlib.util
 import inspect
 import itertools
+import json
 from datetime import datetime
 from pathlib import Path
 import re
@@ -123,6 +124,9 @@ class ManagerCore:
         singleton_object: Any | None = None,
         verbose: bool = False,
         client_lease_sec: float = 90.0,
+        cacheable_functions: set[str] | None = None,
+        cache_resolver: Any | None = None,
+        cache_invalidate: Any | None = None,
     ):
         self.backend = importlib.import_module(backend_module)
         self.db = OwnershipDB(db_path)
@@ -140,6 +144,15 @@ class ManagerCore:
         self._last_seen: dict[str, float] = {}
         self._last_seen_lock = Lock()
         self._started_at = time.monotonic()
+        # Read cache: key -> (value, sampled_ts). Device-agnostic; the device
+        # supplies the policy (which functions cache, how to resolve a fine
+        # read from a coarse entry, what a write invalidates).
+        self.cacheable_functions: set[str] = set(cacheable_functions or ())
+        self._cache_resolver = cache_resolver
+        self._cache_invalidate = cache_invalidate
+        self._cache: dict[tuple, tuple[Any, float]] = {}
+        self._poll_set: dict[tuple, tuple[str, list, dict, float]] = {}
+        self._cache_lock = Lock()
 
     def _call_singleton(self, method_name: str, args: list[Any], kwargs: dict[str, Any]) -> Any:
         target = self._singleton_object
@@ -148,6 +161,102 @@ class ManagerCore:
         with self._singleton_lock:
             method = _resolve_backend_callable(target, method_name)
             return method(*args, **kwargs)
+
+    # --- read cache -------------------------------------------------------
+    @staticmethod
+    def _cache_key(function: str, args: list[Any], kwargs: dict[str, Any]) -> tuple:
+        return (str(function), json.dumps(args, sort_keys=True, default=str),
+                json.dumps(kwargs, sort_keys=True, default=str))
+
+    def _cache_get(self, key: tuple) -> tuple[Any, float] | None:
+        with self._cache_lock:
+            return self._cache.get(key)
+
+    def _cache_put(self, key: tuple, value: Any, ts: float) -> None:
+        with self._cache_lock:
+            self._cache[key] = (value, ts)
+
+    def register_poll(self, function: str, args: list[Any] | None = None,
+                      kwargs: dict[str, Any] | None = None) -> None:
+        """Add a read to the background poll-set (device hooks pre-seed this)."""
+        args = list(args or [])
+        kwargs = dict(kwargs or {})
+        key = self._cache_key(function, args, kwargs)
+        with self._cache_lock:
+            self._poll_set[key] = (str(function), args, kwargs, time.monotonic())
+
+    def _touch_poll(self, key: tuple, function: str, args: list[Any], kwargs: dict[str, Any]) -> None:
+        with self._cache_lock:
+            self._poll_set[key] = (function, list(args), dict(kwargs), time.monotonic())
+
+    def cached_call(self, function: str, args: list[Any] | None = None,
+                    kwargs: dict[str, Any] | None = None, fresh: bool = False) -> tuple[Any, float, bool]:
+        """Read through the cache. Returns (value, sampled_ts, cached)."""
+        args = list(args or [])
+        kwargs = dict(kwargs or {})
+        key = self._cache_key(function, args, kwargs)
+        if not fresh:
+            if self._cache_resolver is not None:
+                resolved = self._cache_resolver(function, args, kwargs, self)
+                if resolved is not None:
+                    value, ts = resolved
+                    return value, ts, True
+            hit = self._cache_get(key)
+            if hit is not None:
+                value, ts = hit
+                self._touch_poll(key, function, args, kwargs)  # keep it in the poll-set
+                return value, ts, True
+        value = self._invoke_function(function, args, kwargs)
+        ts = time.time()
+        self._cache_put(key, value, ts)
+        self._touch_poll(key, function, args, kwargs)
+        return value, ts, False
+
+    def cache_lookup(self, function: str, args: list[Any], kwargs: dict[str, Any]) -> tuple[Any, float] | None:
+        """Exact-key cache lookup (for use by a cache_resolver)."""
+        return self._cache_get(self._cache_key(function, args, kwargs))
+
+    def cache_snapshot(self) -> dict[tuple, tuple[Any, float]]:
+        """Shallow copy of the cache (for a cache_resolver that must scan)."""
+        with self._cache_lock:
+            return dict(self._cache)
+
+    def _invoke_function(self, function: str, args: list[Any], kwargs: dict[str, Any]) -> Any:
+        fn_spec = self.functions.get(str(function))
+        if fn_spec is None:
+            raise RuntimeError(f"unknown function: {function}")
+        return self._dispatch(fn_spec, str(function), list(args), dict(kwargs), handle=None, client="")
+
+    def poll_cache_once(self) -> None:
+        with self._cache_lock:
+            entries = list(self._poll_set.items())
+        for key, (function, args, kwargs, _ts) in entries:
+            try:
+                value = self._invoke_function(function, args, kwargs)
+            except Exception as exc:
+                self._log(f"cache poll failed for {function}{args}: {exc}")
+                continue
+            self._cache_put(key, value, time.time())
+
+    def set_cache_policy(self, resolver: Any | None = None, invalidate: Any | None = None) -> None:
+        """Install device-specific cache hooks (called from an init hook)."""
+        if resolver is not None:
+            self._cache_resolver = resolver
+        if invalidate is not None:
+            self._cache_invalidate = invalidate
+
+    def _invalidate_cache(self, function: str, args: list[Any], kwargs: dict[str, Any]) -> None:
+        if self._cache_invalidate is None:
+            return
+        try:
+            keys = self._cache_invalidate(function, args, kwargs)
+        except Exception:
+            return
+        if not keys:
+            return
+        with self._cache_lock:
+            for k in keys:
+                self._cache.pop(k, None)
 
     def _note_client_seen(self, client: str) -> None:
         with self._last_seen_lock:
@@ -429,6 +538,15 @@ class ManagerCore:
                     "error": f"resource '{resource}' is owned by '{owner}'",
                 }
 
+        # Cacheable reads (unless the client asked for a fresh value) are served
+        # from the shared cache; misses populate it and register it for polling.
+        if str(function) in self.cacheable_functions and not request.get("fresh") and handle is None:
+            try:
+                value, ts, cached = self.cached_call(str(function), list(args), dict(kwargs), fresh=False)
+            except Exception:
+                return {"status": "error", "error": f"backend call failed: {traceback.format_exc(limit=2)}"}
+            return {"status": "ok", "result": value, "cached": bool(cached), "ts": ts}
+
         try:
             result = self._dispatch(
                 fn_spec,
@@ -443,6 +561,12 @@ class ManagerCore:
                 "status": "error",
                 "error": f"backend call failed: {traceback.format_exc(limit=2)}",
             }
+        # A fresh cacheable read updates the cache; any other call may invalidate.
+        if str(function) in self.cacheable_functions and handle is None:
+            ts = time.time()
+            self._cache_put(self._cache_key(str(function), list(args), dict(kwargs)), result, ts)
+            return {"status": "ok", "result": result, "cached": False, "ts": ts}
+        self._invalidate_cache(str(function), list(args), dict(kwargs))
         return {"status": "ok", "result": result}
 
     def shutdown(self) -> None:
@@ -494,6 +618,8 @@ def serve_manager(
     singleton_file_function: str = "get_singleton",
     verbose: bool = False,
     client_lease_sec: float = 90.0,
+    cacheable_functions: set[str] | None = None,
+    cache_poll_interval: float = 0.0,
 ) -> None:
     if init_file and init_function:
         raise ValueError("init_file and init_function are mutually exclusive")
@@ -504,12 +630,17 @@ def serve_manager(
     if singleton_file and singleton_function:
         raise ValueError("singleton_file and singleton_function are mutually exclusive")
 
+    # Caching is only active when a poll interval is set, so the default
+    # (interval 0) keeps the historical stateless pass-through behavior and
+    # never serves a value that would never be refreshed.
+    _cache_on = float(cache_poll_interval or 0.0) > 0.0
     core = ManagerCore(
         backend_module=backend_module,
         db_path=db_path,
         functions=functions,
         verbose=verbose,
         client_lease_sec=client_lease_sec,
+        cacheable_functions=(cacheable_functions if _cache_on else None),
     )
     hook_context: dict[str, Any] = {
         "backend": core.backend,
@@ -526,6 +657,8 @@ def serve_manager(
     }
     periodic_thread: Thread | None = None
     periodic_stop = Event()
+    cache_poll_thread: Thread | None = None
+    cache_poll_stop = Event()
     try:
         init_result: Any = None
         init_cb = None
@@ -568,12 +701,25 @@ def serve_manager(
             periodic_thread.start()
             core._log(f"periodic hook started interval={interval_sec:.3f}s")
 
+        cache_interval = float(cache_poll_interval or 0.0)
+        if cache_interval > 0.0 and core.cacheable_functions:
+            def _cache_loop() -> None:
+                while not cache_poll_stop.wait(cache_interval):
+                    core.poll_cache_once()
+
+            cache_poll_thread = Thread(target=_cache_loop, name="devman-cache-poll", daemon=True)
+            cache_poll_thread.start()
+            core._log(f"read-cache poller started interval={cache_interval:.3f}s")
+
         with _ManagerTCPServer((host, port), core) as server:
             server.serve_forever()
     finally:
         periodic_stop.set()
+        cache_poll_stop.set()
         if periodic_thread is not None:
             periodic_thread.join(timeout=2.0)
+        if cache_poll_thread is not None:
+            cache_poll_thread.join(timeout=2.0)
         try:
             deinit_cb = None
             if deinit_file:
